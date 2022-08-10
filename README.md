@@ -2,7 +2,7 @@
 
 1. 构造1亿数据：`gg-rand -t 手机 -n 10000000 > label1y.txt`
 1. 编译程序：`go install`
-1. 启动程序：`labeldb`
+1. 启动程序：`PARTITIONS=10 labeldb`，分区数越大，启动会稍慢一些，但是加载文件数据会快很多
 
 ## HTTP API
 
@@ -35,4 +35,19 @@ $ gurl :8080/labels/17638937669 -pb
     },
     "status": "ok"
 }
+```
+
+不同分取值，加载速度的区别:
+
+```sh
+$ PARTITIONS=100 labeldb
+2022/08/11 07:28:28 Listening on 8080
+2022/08/11 07:28:39 start to load file label1.txt
+2022/08/11 07:28:46 load file label1.txt with label label1 complete, cost 6.553783206s
+^C
+
+$ PARTITIONS=10 labeldb
+2022/08/11 07:29:39 Listening on 8080
+2022/08/11 07:29:45 start to load file label1.txt
+2022/08/11 07:30:02 load file label1.txt with label label1 complete, cost 16.577362323s
 ```

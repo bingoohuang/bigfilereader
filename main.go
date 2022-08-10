@@ -12,6 +12,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -21,7 +22,7 @@ func main() {
 	flag.Parse()
 
 	db := &pebbleDB{}
-	if err := db.Open("labelsdb/db", 10); err != nil {
+	if err := db.Open("labelsdb/db", Partitions); err != nil {
 		log.Fatal(err)
 	}
 	defer db.Close()
@@ -43,7 +44,7 @@ func main() {
 			return err
 		}
 		cost := time.Since(start)
-		log.Printf("load file %s with lable %s complete, cost %s", file, label, cost)
+		log.Printf("load file %s with label %s complete, cost %s", file, label, cost)
 		return jsonResponse(w, H{"cost": cost.String(), "lines": lines})
 	}))
 
@@ -114,7 +115,7 @@ type pebbleDB struct {
 }
 
 func (s *pebbleDB) FindLabelsByMobile(partitionKey, mobile []byte) (labels []string) {
-	partition := Hash(partitionKey) % uint64(len(s.dbs))
+	partition := s.Partition(partitionKey)
 	db := s.dbs[partition]
 
 	keyUpperBound := func(b []byte) []byte {
@@ -149,7 +150,7 @@ func (s *pebbleDB) FindLabelsByMobile(partitionKey, mobile []byte) (labels []str
 
 // Set implements DB
 func (s *pebbleDB) Set(partitionKey, key []byte) {
-	partition := Hash(partitionKey) % uint64(len(s.dbs))
+	partition := s.Partition(partitionKey)
 	s.dbc[partition] <- key
 }
 
@@ -169,10 +170,10 @@ func (s *pebbleDB) Close() (err error) {
 var zeroBytes = make([]byte, 0)
 
 // Open implements DB
-func (s *pebbleDB) Open(path string, partitions int) (err error) {
+func (s *pebbleDB) Open(path string, partitions uint64) (err error) {
 	s.dbs = make([]*pebble.DB, partitions)
 	s.dbc = make([]chan []byte, partitions)
-	for i := 0; i < partitions; i++ {
+	for i := uint64(0); i < partitions; i++ {
 		name := fmt.Sprintf("%s.%d", path, i)
 		s.dbs[i], err = pebble.Open(name, &pebble.Options{})
 		if err != nil {
@@ -194,4 +195,18 @@ func (s *pebbleDB) Open(path string, partitions int) (err error) {
 	}
 
 	return nil
+}
+
+func (s *pebbleDB) Partition(partitionKey []byte) uint64 {
+	return Hash(partitionKey) % Partitions
+}
+
+var Partitions = uint64(10)
+
+func init() {
+	if p := os.Getenv("PARTITIONS"); p != "" {
+		if n, err := strconv.Atoi(p); err == nil && n > 0 {
+			Partitions = uint64(n)
+		}
+	}
 }
