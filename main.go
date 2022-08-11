@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -9,11 +8,15 @@ import (
 	"github.com/cockroachdb/pebble"
 	"github.com/julienschmidt/httprouter"
 	"go.uber.org/multierr"
+	"io"
 	"log"
 	"net/http"
 	"os"
+	"runtime"
 	"strconv"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -27,41 +30,15 @@ func main() {
 	}
 	defer db.Close()
 
-	router := httprouter.New()
-	router.POST("/load/:file/:label", wrapHandler(func(w http.ResponseWriter, r *http.Request, p httprouter.Params) error {
-		file := p.ByName("file")
-		label := p.ByName("label")
-		noop := r.URL.Query().Has("noop")
-		log.Printf("start to load file %s", file)
-		start := time.Now()
-		lines := 0
-		if err := scanFile(file, func(line string) {
-			lines++
-			if !noop {
-				db.Set([]byte(line), []byte(line+label))
-			}
-		}); err != nil {
-			return err
-		}
-		cost := time.Since(start)
-		log.Printf("load file %s with label %s complete, cost %s", file, label, cost)
-		return jsonResponse(w, H{"cost": cost.String(), "lines": lines})
-	}))
-
-	router.GET("/labels/:mobile", wrapHandler(func(w http.ResponseWriter, r *http.Request, p httprouter.Params) error {
-		mobile := p.ByName("mobile")
-		mobileBytes := []byte(mobile)
-		start := time.Now()
-		labels := db.FindLabelsByMobile(mobileBytes, mobileBytes)
-		cost := time.Since(start)
-		return jsonResponse(w, H{"cost": cost.String(), "labels": labels})
-	}))
+	r := httprouter.New()
+	r.POST("/load/:file/:label", wrapHandler(db.LoadFile))
+	r.GET("/labels/:mobile", wrapHandler(db.GetLabel))
 
 	log.Printf("Listening on %d", *pPort)
-	log.Fatal(http.ListenAndServe(fmt.Sprintf(":%d", *pPort), router))
+	log.Fatal(http.ListenAndServe(fmt.Sprintf(":%d", *pPort), r))
 }
 
-func wrapHandler(h func(http.ResponseWriter, *http.Request, httprouter.Params) error) func(http.ResponseWriter, *http.Request, httprouter.Params) {
+func wrapHandler(h func(http.ResponseWriter, *http.Request, httprouter.Params) error) httprouter.Handle {
 	return func(w http.ResponseWriter, r *http.Request, p httprouter.Params) {
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		if err := h(w, r, p); err != nil {
@@ -88,18 +65,125 @@ func jsonResponseError(w http.ResponseWriter, err error) {
 	}
 }
 
-func scanFile(file string, lineCallback func(line string)) error {
+func scanFilePart(file string, wg *sync.WaitGroup, lineCallback func(line string), start, end int, chop *Chop) {
+	defer wg.Done()
+
 	f, err := os.OpenFile(file, os.O_RDONLY, os.ModePerm)
 	if err != nil {
-		return err
+		log.Fatal(err)
 	}
 	defer f.Close()
 
-	sc := bufio.NewScanner(f)
-	for sc.Scan() {
-		lineCallback(sc.Text())
+	if start > 0 {
+		if _, err := f.Seek(int64(start), io.SeekStart); err != nil {
+			log.Fatal(err)
+		}
 	}
-	return sc.Err()
+
+	var line []byte
+	countBytes := end - start
+	const bufferSize = 16 * 1024
+	buffer := make([]byte, bufferSize)
+	lines := 0
+	lineStarted := false
+	for total := 0; total < countBytes; {
+		n, err := f.Read(buffer)
+		if err == io.EOF {
+			break
+		} else if err != nil {
+			log.Fatal(err)
+		}
+
+		total += n
+		if total > countBytes {
+			n -= total - countBytes
+		}
+
+		bb := buffer[:n]
+		for _, b := range bb {
+			if IsSpace(b) {
+				if b == '\n' {
+					chop.linebreak = true
+					if !lineStarted {
+						lineStarted = true
+					}
+
+					if len(line) > 0 {
+						lines++
+						lineCallback(strings.TrimSpace(string(line)))
+						line = line[:0]
+					}
+				}
+			} else if lineStarted {
+				line = append(line, b)
+			} else {
+				chop.head = append(chop.head, b)
+			}
+		}
+	}
+	chop.tail = append(chop.tail, line...)
+}
+
+func IsSpace(b byte) bool {
+	switch b {
+	case ' ', '\t', '\r', '\v', '\f', '\n':
+		return true
+	default:
+		return false
+	}
+}
+
+type Chop struct {
+	head      []byte
+	tail      []byte
+	linebreak bool
+}
+
+func scanFile(file string, lineCallback func(line string)) error {
+	stat, err := os.Stat(file)
+	if err != nil {
+		return err
+	}
+
+	numWorkers := runtime.NumCPU()
+	fileSize := int(stat.Size())
+	workerSize := fileSize / numWorkers
+	var wg sync.WaitGroup
+
+	chops := make([]*Chop, numWorkers)
+
+	for i := 0; i < numWorkers; i++ {
+		start := i * workerSize
+		end := start + workerSize
+		if end > fileSize {
+			end = fileSize
+		}
+
+		chops[i] = &Chop{}
+		wg.Add(1)
+		go scanFilePart(file, &wg, lineCallback, start, end, chops[i])
+	}
+
+	wg.Wait()
+
+	var line []byte
+
+	for i := 0; i < numWorkers; i++ {
+		chop := chops[i]
+		line = append(line, chop.head...)
+		if chop.linebreak {
+			if len(line) > 0 {
+				lineCallback(string(line))
+				line = line[:0]
+			}
+		}
+		line = append(line, chop.tail...)
+	}
+	if len(line) > 0 {
+		lineCallback(string(line))
+	}
+
+	return nil
 }
 
 func Hash(data []byte) uint64 {
@@ -112,6 +196,35 @@ type pebbleDB struct {
 	dbs []*pebble.DB // Primary data
 	dbc []chan []byte
 	sync.WaitGroup
+}
+
+func (s *pebbleDB) GetLabel(w http.ResponseWriter, r *http.Request, p httprouter.Params) error {
+	mobile := p.ByName("mobile")
+	mobileBytes := []byte(mobile)
+	start := time.Now()
+	labels := s.FindLabelsByMobile(mobileBytes, mobileBytes)
+	cost := time.Since(start)
+	return jsonResponse(w, H{"cost": cost.String(), "labels": labels})
+}
+
+func (s *pebbleDB) LoadFile(w http.ResponseWriter, r *http.Request, p httprouter.Params) error {
+	file := p.ByName("file")
+	label := p.ByName("label")
+	noop := r.URL.Query().Has("noop")
+	log.Printf("start to load file %s", file)
+	start := time.Now()
+	var lines atomic.Uint64
+	if err := scanFile(file, func(line string) {
+		lines.Add(1)
+		if !noop {
+			s.Set([]byte(line), []byte(line+label))
+		}
+	}); err != nil {
+		return err
+	}
+	cost := time.Since(start)
+	log.Printf("load file %s with label %s andl lines %d complete, cost %s", file, label, lines.Load(), cost)
+	return jsonResponse(w, H{"cost": cost.String(), "lines": lines.Load()})
 }
 
 func (s *pebbleDB) FindLabelsByMobile(partitionKey, mobile []byte) (labels []string) {

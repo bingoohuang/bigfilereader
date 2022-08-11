@@ -1,8 +1,8 @@
 # 标签系统
 
-1. 构造1亿数据：`gg-rand -t 手机 -n 10000000 > label1y.txt`
-1. 编译程序：`go install`
-1. 启动程序：`PARTITIONS=10 labeldb`，分区数越大，启动会稍慢一些，但是加载文件数据会快很多
+1. 构造1亿数据：`gg-rand -t 手机 -n 10000000 > label1qw.txt`
+2. 编译程序：`go install`
+3. 启动程序：`PARTITIONS=10 labeldb`，分区数越大，启动会稍慢一些，但是加载文件数据会快很多
 
 ## HTTP API
 
@@ -14,7 +14,7 @@
 加载1亿手机数据，其标签为 label1
 
 ```sh
-$ gurl POST :8080/load/label1y.txt/label1 -pb
+$ gurl POST :8080/load/label1qw.txt/label1 -pb
 {
     "body": {
         "cost": "15.813194653s",
@@ -50,4 +50,20 @@ $ PARTITIONS=10 labeldb
 2022/08/11 07:29:39 Listening on 8080
 2022/08/11 07:29:45 start to load file label1.txt
 2022/08/11 07:30:02 load file label1.txt with label label1 complete, cost 16.577362323s
+```
+
+```sh
+$ PARTITIONS=100 labeldb
+2022/08/11 11:25:08 Listening on 8080
+2022/08/11 11:25:26 start to load file label1y.txt
+2022/08/11 11:27:46 load file label1y.txt with label label2 andl lines 100000000 complete, cost 2m19.115438496s
+
+$ gurl -pb :8080/labels/17660679064
+{
+  "body": {
+    "cost": "1.280604ms",
+    "labels": ["label2"]
+  },
+  "status": "ok"
+}
 ```
