@@ -139,7 +139,7 @@ type Chop struct {
 	linebreak bool
 }
 
-func scanFile(file string, lineCallback func(line string)) error {
+func scanFile(file string, async bool, lineCallback func(line string)) error {
 	stat, err := os.Stat(file)
 	if err != nil {
 		return err
@@ -161,7 +161,11 @@ func scanFile(file string, lineCallback func(line string)) error {
 
 		chops[i] = &Chop{}
 		wg.Add(1)
-		go scanFilePart(file, &wg, lineCallback, start, end, chops[i])
+		if async {
+			go scanFilePart(file, &wg, lineCallback, start, end, chops[i])
+		} else {
+			scanFilePart(file, &wg, lineCallback, start, end, chops[i])
+		}
 	}
 
 	wg.Wait()
@@ -211,10 +215,11 @@ func (s *pebbleDB) LoadFile(w http.ResponseWriter, r *http.Request, p httprouter
 	file := p.ByName("file")
 	label := p.ByName("label")
 	noop := r.URL.Query().Has("noop")
+	async := !r.URL.Query().Has("sync")
 	log.Printf("start to load file %s", file)
 	start := time.Now()
 	var lines atomic.Uint64
-	if err := scanFile(file, func(line string) {
+	if err := scanFile(file, async, func(line string) {
 		lines.Add(1)
 		if !noop {
 			s.Set([]byte(line), []byte(line+label))
@@ -223,7 +228,7 @@ func (s *pebbleDB) LoadFile(w http.ResponseWriter, r *http.Request, p httprouter
 		return err
 	}
 	cost := time.Since(start)
-	log.Printf("load file %s with label %s andl lines %d complete, cost %s", file, label, lines.Load(), cost)
+	log.Printf("load file: %s with label: %s, lines: %d, async: %t complete, cost %s", file, label, lines.Load(), async, cost)
 	return jsonResponse(w, H{"cost": cost.String(), "lines": lines.Load()})
 }
 

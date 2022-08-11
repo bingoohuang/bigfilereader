@@ -67,3 +67,53 @@ $ gurl -pb :8080/labels/17660679064
   "status": "ok"
 }
 ```
+
+## 并发读取大文件的性能对比
+
+一亿行手机数据，非并发读取要 5。7 秒，12 并发读取要 2.7 秒。
+
+```sh
+$ labeldb
+2022/08/11 12:17:10 Listening on 8080
+2022/08/11 12:17:14 start to load file label1y.txt
+2022/08/11 12:17:20 load file: label1y.txt with label: label2, lines: 100000000, async: false complete, cost 5.71991491s
+2022/08/11 12:17:40 start to load file label1y.txt
+2022/08/11 12:17:43 load file: label1y.txt with label: label2, lines: 100000000, async: true complete, cost 2.737779378s
+```
+
+```sh
+$ gurl POST :8080/load/label1y.txt/label2 noop==y sync==y  -ugly
+POST /load/label1y.txt/label2?noop=y&sync=y HTTP/1.1
+Host: 127.0.0.1:8080
+Accept: application/json
+Accept-Encoding: gzip, deflate
+Content-Type: application/json
+Gurl-Date: Thu, 11 Aug 2022 04:17:14 GMT
+User-Agent: gurl/1.0.0
+
+
+HTTP/1.1 200 OK
+Content-Type: application/json; charset=utf-8
+Date: Thu, 11 Aug 2022 04:17:20 GMT
+Content-Length: 64
+
+{"body":{"cost":"5.71991491s","lines":100000000},"status":"ok"}
+
+$ gurl POST :8080/load/label1y.txt/label2 noop==y  -ugly
+POST /load/label1y.txt/label2?noop=y HTTP/1.1
+Host: 127.0.0.1:8080
+Accept: application/json
+Accept-Encoding: gzip, deflate
+Content-Type: application/json
+Gurl-Date: Thu, 11 Aug 2022 04:17:40 GMT
+User-Agent: gurl/1.0.0
+
+
+HTTP/1.1 200 OK
+Content-Type: application/json; charset=utf-8
+Date: Thu, 11 Aug 2022 04:17:43 GMT
+Content-Length: 65
+
+{"body":{"cost":"2.737779378s","lines":100000000},"status":"ok"}
+
+```
