@@ -1,13 +1,11 @@
 package main
 
 import (
+	"bytes"
+	"encoding/binary"
 	"encoding/json"
 	"flag"
 	"fmt"
-	"github.com/cespare/xxhash/v2"
-	"github.com/cockroachdb/pebble"
-	"github.com/julienschmidt/httprouter"
-	"go.uber.org/multierr"
 	"io"
 	"log"
 	"net/http"
@@ -18,6 +16,11 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/cespare/xxhash/v2"
+	"github.com/cockroachdb/pebble"
+	"github.com/julienschmidt/httprouter"
+	"go.uber.org/multierr"
 )
 
 func main() {
@@ -65,7 +68,7 @@ func jsonResponseError(w http.ResponseWriter, err error) {
 	}
 }
 
-func scanFilePart(file string, wg *sync.WaitGroup, lineCallback func(line string), start, end int, chop *Chop) {
+func scanFilePart(file string, wg *sync.WaitGroup, lineCallback func(line string) error, start, end int, chop *Chop) error {
 	defer wg.Done()
 
 	f, err := os.OpenFile(file, os.O_RDONLY, os.ModePerm)
@@ -110,7 +113,9 @@ func scanFilePart(file string, wg *sync.WaitGroup, lineCallback func(line string
 
 					if len(line) > 0 {
 						lines++
-						lineCallback(strings.TrimSpace(string(line)))
+						if err := lineCallback(strings.TrimSpace(string(line))); err != nil {
+							return err
+						}
 						line = line[:0]
 					}
 				}
@@ -122,6 +127,7 @@ func scanFilePart(file string, wg *sync.WaitGroup, lineCallback func(line string
 		}
 	}
 	chop.tail = append(chop.tail, line...)
+	return nil
 }
 
 func IsSpace(b byte) bool {
@@ -139,7 +145,7 @@ type Chop struct {
 	linebreak bool
 }
 
-func scanFile(file string, async bool, lineCallback func(line string)) error {
+func scanFile(file string, syncMode bool, lineCallback func(line string) error) error {
 	stat, err := os.Stat(file)
 	if err != nil {
 		return err
@@ -161,10 +167,14 @@ func scanFile(file string, async bool, lineCallback func(line string)) error {
 
 		chops[i] = &Chop{}
 		wg.Add(1)
-		if async {
-			go scanFilePart(file, &wg, lineCallback, start, end, chops[i])
-		} else {
-			scanFilePart(file, &wg, lineCallback, start, end, chops[i])
+		if !syncMode {
+			go func(c *Chop, start, end int) {
+				if err := scanFilePart(file, &wg, lineCallback, start, end, c); err != nil {
+					log.Fatal(err)
+				}
+			}(chops[i], start, end)
+		} else if err := scanFilePart(file, &wg, lineCallback, start, end, chops[i]); err != nil {
+			return err
 		}
 	}
 
@@ -177,14 +187,18 @@ func scanFile(file string, async bool, lineCallback func(line string)) error {
 		line = append(line, chop.head...)
 		if chop.linebreak {
 			if len(line) > 0 {
-				lineCallback(string(line))
+				if err := lineCallback(string(line)); err != nil {
+					return err
+				}
 				line = line[:0]
 			}
 		}
 		line = append(line, chop.tail...)
 	}
 	if len(line) > 0 {
-		lineCallback(string(line))
+		if err := lineCallback(string(line)); err != nil {
+			return err
+		}
 	}
 
 	return nil
@@ -198,42 +212,69 @@ func Hash(data []byte) uint64 {
 
 type pebbleDB struct {
 	dbs []*pebble.DB // Primary data
-	dbc []chan []byte
+	dbc []chan op
 	sync.WaitGroup
 }
 
 func (s *pebbleDB) GetLabel(w http.ResponseWriter, r *http.Request, p httprouter.Params) error {
-	mobile := p.ByName("mobile")
-	mobileBytes := []byte(mobile)
 	start := time.Now()
-	labels := s.FindLabelsByMobile(mobileBytes, mobileBytes)
+	mobile, err := mobile2bytes(p.ByName("mobile"))
+	if err != nil {
+		return err
+	}
+
+	labels, err := s.FindLabelsByMobile(mobile)
+	if err != nil {
+		return err
+	}
+
 	cost := time.Since(start)
 	return jsonResponse(w, H{"cost": cost.String(), "labels": labels})
+}
+
+func IsBool(s string) bool {
+	return FoldAnyOf(s, "y", "1", "t", "yes", "true", "on")
+}
+
+func FoldAnyOf(t string, bb ...string) bool {
+	for _, b := range bb {
+		if strings.EqualFold(t, b) {
+			return true
+		}
+	}
+
+	return false
 }
 
 func (s *pebbleDB) LoadFile(w http.ResponseWriter, r *http.Request, p httprouter.Params) error {
 	file := p.ByName("file")
 	label := p.ByName("label")
-	noop := r.URL.Query().Has("noop")
-	async := !r.URL.Query().Has("sync")
+	noop := IsBool(r.URL.Query().Get("noop"))
+	syncMode := IsBool(r.URL.Query().Get("sync"))
 	log.Printf("start to load file %s", file)
 	start := time.Now()
 	var lines atomic.Uint64
-	if err := scanFile(file, async, func(line string) {
+	if err := scanFile(file, syncMode, func(line string) error {
 		lines.Add(1)
 		if !noop {
-			s.Set([]byte(line), []byte(line+label))
+			mobile, err := mobile2bytes(line)
+			if err != nil {
+				return err
+			}
+			s.Append(mobile, []byte(label))
+			return nil
 		}
+		return nil
 	}); err != nil {
 		return err
 	}
 	cost := time.Since(start)
-	log.Printf("load file: %s with label: %s, lines: %d, async: %t complete, cost %s", file, label, lines.Load(), async, cost)
+	log.Printf("load file: %s with label: %s, lines: %d, sync: %t complete, cost %s", file, label, lines.Load(), syncMode, cost)
 	return jsonResponse(w, H{"cost": cost.String(), "lines": lines.Load()})
 }
 
-func (s *pebbleDB) FindLabelsByMobile(partitionKey, mobile []byte) (labels []string) {
-	partition := s.Partition(partitionKey)
+func (s *pebbleDB) FindLabelsByMobile(mobile []byte) (labels []string, err error) {
+	partition := s.Partition(mobile)
 	db := s.dbs[partition]
 
 	keyUpperBound := func(b []byte) []byte {
@@ -260,16 +301,50 @@ func (s *pebbleDB) FindLabelsByMobile(partitionKey, mobile []byte) (labels []str
 		labels = append(labels, string(key[len(mobile):]))
 	}
 	if err := iter.Close(); err != nil {
-		log.Fatal(err)
+		return nil, err
 	}
 
-	return labels
+	return labels, err
+}
+
+func (s *pebbleDB) Append(key, value []byte) {
+	partition := s.Partition(key)
+	s.dbc[partition] <- op{
+		typ:   opSet,
+		key:   append(key, value...),
+		value: []byte{},
+	}
+}
+
+func (s *pebbleDB) Get(key []byte) (values []string, err error) {
+	partition := s.Partition(key)
+	value, closer, err := s.dbs[partition].Get(key)
+	if closer != nil {
+		defer closer.Close()
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	if err == pebble.ErrNotFound {
+		return nil, nil
+	}
+
+	for _, l := range bytes.Split(value, []byte(",")) {
+		values = append(values, string(l))
+	}
+
+	return values, nil
 }
 
 // Set implements DB
-func (s *pebbleDB) Set(partitionKey, key []byte) {
-	partition := s.Partition(partitionKey)
-	s.dbc[partition] <- key
+func (s *pebbleDB) Set(key, value []byte) {
+	partition := s.Partition(key)
+	s.dbc[partition] <- op{
+		typ:   opSet,
+		key:   key,
+		value: value,
+	}
 }
 
 // Close implements DB
@@ -285,12 +360,23 @@ func (s *pebbleDB) Close() (err error) {
 	return err
 }
 
-var zeroBytes = make([]byte, 0)
+type opType uint32
+
+const (
+	_ opType = iota
+	opSet
+	opAppend
+)
+
+type op struct {
+	typ        opType
+	key, value []byte
+}
 
 // Open implements DB
 func (s *pebbleDB) Open(path string, partitions uint64) (err error) {
 	s.dbs = make([]*pebble.DB, partitions)
-	s.dbc = make([]chan []byte, partitions)
+	s.dbc = make([]chan op, partitions)
 	for i := uint64(0); i < partitions; i++ {
 		name := fmt.Sprintf("%s.%d", path, i)
 		s.dbs[i], err = pebble.Open(name, &pebble.Options{})
@@ -298,16 +384,37 @@ func (s *pebbleDB) Open(path string, partitions uint64) (err error) {
 			return err
 		}
 
-		s.dbc[i] = make(chan []byte, 10000)
+		s.dbc[i] = make(chan op, 10000)
 		s.Add(1)
-		go func(db *pebble.DB, c chan []byte) {
+		go func(db *pebble.DB, c chan op) {
 			defer s.Done()
 
 			for k := range c {
-				if err := db.Set(k, zeroBytes, pebble.NoSync); err != nil {
-					log.Fatal(err)
-				}
+				switch k.typ {
+				case opSet:
+					if err := db.Set(k.key, k.value, pebble.NoSync); err != nil {
+						log.Fatal(err)
+					}
+				case opAppend:
+					v, closer, err := db.Get(k.key)
+					if err == pebble.ErrNotFound {
+						err = nil
+					}
+					if err != nil {
+						log.Fatal(err)
+					}
+					if len(v) > 0 {
+						k.value = append(k.value, ',')
+						k.value = append(k.value, v...)
+					}
+					if closer != nil {
+						closer.Close()
+					}
 
+					if err := db.Set(k.key, k.value, pebble.NoSync); err != nil {
+						log.Fatal(err)
+					}
+				}
 			}
 		}(s.dbs[i], s.dbc[i])
 	}
@@ -327,4 +434,19 @@ func init() {
 			Partitions = uint64(n)
 		}
 	}
+}
+
+func mobile2bytes(s string) ([]byte, error) {
+	u, err := strconv.ParseUint(s, 10, 64)
+	if err != nil {
+		return nil, err
+	}
+
+	b := make([]byte, 8)
+	binary.LittleEndian.PutUint64(b, u)
+	return b, nil
+}
+
+func bytes2uint64(b []byte) uint64 {
+	return binary.LittleEndian.Uint64(b)
 }
